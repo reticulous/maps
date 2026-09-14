@@ -205,7 +205,7 @@ PY
     Xvfb "$DISPLAY" -nolisten unix >/tmp/xvfb.log 2>&1 &
     node /usr/src/app --config "$RUN/config.json" -p "$PORT" -b 127.0.0.1 \
         >/tmp/tileserver.log 2>&1 &
-    local SERVER_PID=$!
+    SERVER_PID=$!
     trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
     local TILE_URL="http://127.0.0.1:$PORT/styles/$STYLE_ID/{z}/{x}/{y}.png"
