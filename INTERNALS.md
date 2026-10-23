@@ -129,7 +129,7 @@ waypoint list is shared under `s_wpMux` (see Waypoints).
 
 The view centre comes, in order, from: the GPS fix while following; a pan;
 before either, `s.maps.center` (at `s.maps.zoom`); and on a first open, with no
-saved centre, `coverageView`. The fix takes over when it arrives, unless the
+saved centre, `deepestCentre`. The fix takes over when it arrives, unless the
 user has panned (`s_follow` cleared). The acquisition screen shows only when
 none of these yields a view.
 
@@ -139,16 +139,19 @@ none of these yields a view.
   worker, which finds `s_open` false). It skips a write when the value is
   unchanged. `onChange` ignores `s.maps.center`, so the write doesn't trigger a
   rebuild through the `s.maps` subscription.
-- **First-open framing.** `coverageView` goes down from `ZOOM_MAX`. At each level
-  it adds that level's tile box (`levelExtent`: min/max `x` over the `<z>/`
-  directory names, min/max `y` over the files in each `<z>/<x>/`) to a running
-  box. It stops at the first level where the box fits the canvas, and centres
-  there; `ZOOM_MIN` if it never fits. Because the box only takes in deeper
-  levels first, a detailed bake over a world base frames the detailed area.
-  The listing reads every tile directory, so it runs only while there is no
-  saved centre, behind a "Looking for map tiles..." screen
-  (`maps.state = searching`). A tile dir found empty is remembered
-  (`s_noTilesDir`) and not listed again until the dir changes.
+- **First-open centre.** `deepestCentre` goes down from `ZOOM_MAX` to the first
+  `<z>/` directory holding tile columns. The columns span its lowest to highest
+  `<x>` directory name; the rows span the lowest to highest `<y>` in the lowest
+  column only. The view centres on that box. That is two directory listings
+  whatever the size of the bake: the SD card's read path takes a DMA-capable
+  internal bounce buffer per sector, so a search that lists every tile
+  directory is not affordable. The zoom is left at `s.maps.zoom`; the
+  effective-zoom search then settles on the deepest level with a tile under
+  the centre. A detailed bake over a world base opens on the detailed area. If
+  the deepest level holds several separate areas the centre can fall between
+  them, where a coarser level still shows. The search runs behind a "Looking
+  for map tiles..." screen (`maps.state = searching`). A tile dir found empty
+  is remembered (`s_noTilesDir`) and not searched again until the dir changes.
 
 ## GPS as ephemeral storage
 

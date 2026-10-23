@@ -12,7 +12,7 @@
  *   - Follows the GPS fix, or free-pan (drag / trackball-drag) with a
  *     "centre me" button to re-lock to GPS.
  *   - Opens without a fix: at the view it was left at (s.maps.center + zoom),
- *     or on a first open, framing the tiles baked at the deepest levels.
+ *     or on a first open, at the middle of the deepest baked level.
  *   - Overzoom fallback: a missing tile at the display zoom is filled by
  *     upscaling the nearest existing lower-zoom ancestor, so a coarse base map
  *     "shows through" where local detail is absent instead of going grey.
@@ -106,6 +106,8 @@ static portMUX_TYPE s_ctrlMux = portMUX_INITIALIZER_UNLOCKED;
 static long         s_panDx = 0, s_panDy = 0;   /* accumulated drag, screen px */
 static bool         s_recenter = false;
 static int          s_zoomReq  = 0;             /* accumulated +/- button steps */
+static bool         s_gotoReq  = false;
+static double       s_gotoLat = 0, s_gotoLon = 0;
 
 /* Waypoint edits: lcd task / CLI -> worker, a short queue under s_ctrlMux. The
  * worker makes every change to the list and every write of the file. A pin is
@@ -136,6 +138,7 @@ static bool              s_wpBroken = false; /* file there but unreadable: never
 
 static lv_obj_t* s_canvas    = nullptr;
 static lv_obj_t* s_label     = nullptr;
+static lv_obj_t* s_centerBtn = nullptr;
 static uint16_t* s_canvasBuf = nullptr;
 static int       s_W = 0, s_H = 0;       /* canvas size, px */
 static int       s_stridePx  = 0;        /* row pitch, uint16 units */
@@ -173,6 +176,7 @@ enum { MAPS_OK = 0, MAPS_NOFIX, MAPS_NOTILES, MAPS_NOSD, MAPS_SEARCHING };
 struct WpVis { short x, y; char name[WP_NAME + 1]; };
 struct Composite {
     long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; bool zoomChanged;
+    bool   hadFix;
     double viewLat, viewLon;       /* map centre (what a save would store) */
     bool   cross;                  /* view isn't on the GPS fix: draw the crosshair */
     int    nvis; WpVis vis[WP_VIS];            /* visible waypoints, nearest-to-centre first */
@@ -593,61 +597,36 @@ static bool tileNum(const char* s, int* v) {
     return true;
 }
 
-/* What zoom level z holds, as a box in world units (0..1 across the Mercator
- * square); false if it holds no tiles. */
-struct Extent { double x0, y0, x1, y1; };
-
-static bool levelExtent(const std::string& dir, int z, Extent* out) {
-    std::string zd = dir + "/" + std::to_string(z);
-    int dz = fs_opendir(zd.c_str());
-    if (dz < 0) return false;
-    int x0 = INT32_MAX, x1 = -1, y0 = INT32_MAX, y1 = -1;
-    fs_dirent_t xe, ye;
-    while (fs_readdir(dz, &xe)) {
-        int x, y;
-        if (!tileNum(xe.name, &x)) continue;
-        int dx = fs_opendir((zd + "/" + xe.name).c_str());
-        if (dx < 0) continue;
-        bool any = false;
-        while (fs_readdir(dx, &ye)) {
-            if (!tileNum(ye.name, &y)) continue;
-            any = true;
-            if (y < y0) y0 = y;
-            if (y > y1) y1 = y;
-        }
-        fs_closedir(dx);
-        if (any) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
+/* Lowest and highest tile number named in one directory; false if none. */
+static bool numRange(const std::string& path, int* lo, int* hi) {
+    int d = fs_opendir(path.c_str());
+    if (d < 0) return false;
+    int a = INT32_MAX, b = -1, v;
+    fs_dirent_t e;
+    while (fs_readdir(d, &e)) {
+        if (!tileNum(e.name, &v)) continue;
+        if (v < a) a = v;
+        if (v > b) b = v;
     }
-    fs_closedir(dz);
-    if (x1 < 0) return false;
-    const double n = (double)(1u << z);
-    *out = { x0 / n, y0 / n, (x1 + 1) / n, (y1 + 1) / n };
+    fs_closedir(d);
+    if (b < 0) return false;
+    *lo = a; *hi = b;
     return true;
 }
 
-/* First open, with no saved centre: the deepest zoom at which everything baked
- * at that level and deeper fits on the screen, centred on it. Going down from
- * ZOOM_MAX the box only grows, a level at a time, so a city baked to z16 over a
- * world base baked to z7 frames the city: the world joins the box only below
- * z8, by which point the city fits. false if the tile dir holds no tiles. This
- * lists every tile directory, so it runs only while there is no saved centre. */
-static bool coverageView(const std::string& dir, double* lat, double* lon, int* zoom) {
-    Extent u = {};
-    bool have = false;
+/* First open, with no saved centre: the middle of the deepest baked level. Its
+ * columns span the lowest to highest <x> directory name, its rows the lowest to
+ * highest <y> in the first column. Two directory listings, whatever the size of
+ * the bake; the zoom stays s.maps.zoom and the effective-zoom search settles it.
+ * false if the tile dir holds no tiles. */
+static bool deepestCentre(const std::string& dir, double* lat, double* lon) {
     for (int z = ZOOM_MAX; z >= ZOOM_MIN; z--) {
-        Extent e;
-        if (levelExtent(dir, z, &e)) {
-            if (!have) u = e;
-            else u = { fmin(u.x0, e.x0), fmin(u.y0, e.y0), fmax(u.x1, e.x1), fmax(u.y1, e.y1) };
-            have = true;
-        }
-        if (!have) continue;
-        const double px = (double)TILE * (double)(1u << z);
-        if (((u.x1 - u.x0) * px <= s_W && (u.y1 - u.y0) * px <= s_H) || z == ZOOM_MIN) {
-            globalPxToLonLat((u.x0 + u.x1) / 2 * TILE, (u.y0 + u.y1) / 2 * TILE, 0, lon, lat);
-            *zoom = z;
-            return true;
-        }
+        std::string zd = dir + "/" + std::to_string(z);
+        int x0, x1, y0, y1;
+        if (!numRange(zd, &x0, &x1)) continue;
+        if (!numRange(zd + "/" + std::to_string(x0), &y0, &y1)) continue;
+        globalPxToLonLat((x0 + x1 + 1) / 2.0 * TILE, (y0 + y1 + 1) / 2.0 * TILE, z, lon, lat);
+        return true;
     }
     return false;
 }
@@ -833,6 +812,11 @@ static void composite(void* arg) {
         if (msg) { lv_label_set_text(s_label, msg); lv_obj_clear_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
         else     { lv_obj_add_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
     }
+    if (s_centerBtn) {
+        if (c->hadFix) lv_obj_clear_flag(s_centerBtn, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_centerBtn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(s_centerBtn, c->haveFix ? LV_OPA_COVER : LV_OPA_40, 0);
+    }
 
     if (c->toast[0])          showPill(c->toast);
     else if (c->zoomChanged)  showZoomIndicator(c->z);
@@ -862,40 +846,41 @@ static void rebuild(void) {
 
     /* consume pan / recentre / zoom-step from the lcd task */
     long dx, dy; bool recenter; int zoomReq;
+    bool gotoReq; double gotoLat, gotoLon;
     portENTER_CRITICAL(&s_ctrlMux);
     dx = s_panDx; dy = s_panDy; s_panDx = 0; s_panDy = 0;
     recenter = s_recenter; s_recenter = false;
     zoomReq = s_zoomReq; s_zoomReq = 0;
+    gotoReq = s_gotoReq; s_gotoReq = false;
+    gotoLat = s_gotoLat; gotoLon = s_gotoLon;
     portEXIT_CRITICAL(&s_ctrlMux);
     if (recenter)            s_follow = true;
     if ((dx || dy) && s_haveView) s_follow = false;
+    if (gotoReq) { s_viewLat = gotoLat; s_viewLon = gotoLon; s_haveView = true; s_follow = false; }
 
     Composite* c = (Composite*)gp_alloc(sizeof(Composite));
     if (!c) return;
     *c = {};
-    c->z = base; c->markerX = -1; c->markerY = -1; c->haveFix = fix;
+    c->z = base; c->markerX = -1; c->markerY = -1; c->haveFix = fix; c->hadFix = s_haveCenter;
 
     if (!sdAvailable()) { c->state = MAPS_NOSD;  storageSet("maps.state", "no sd");  lcdRun(composite, c); return; }
 
     /* View centre: GPS while following and there is a fix; free-panned (pan is
      * in old-zoom px); before either, where the map was left (s.maps.center at
-     * s.maps.zoom), or on a first open the view framing the baked tiles. The
+     * s.maps.zoom), or on a first open the middle of the deepest baked level. The
      * fix takes over when it arrives unless the user has panned since. */
     static std::string s_noTilesDir;   /* tile dir a first-open search found empty */
     if (s_follow && s_haveCenter) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
     else if (!s_haveView) {
-        double la0, lo0; int z0;
+        double la0, lo0;
         if (loadCenter(&la0, &lo0)) {
             s_viewLat = la0; s_viewLon = lo0; s_haveView = true;
         } else if (dir != s_noTilesDir) {
             Composite* wait = (Composite*)gp_alloc(sizeof(Composite));
-            if (wait) { *wait = {}; wait->state = MAPS_SEARCHING; lcdRun(composite, wait); }
+            if (wait) { *wait = {}; wait->state = MAPS_SEARCHING; wait->hadFix = s_haveCenter; lcdRun(composite, wait); }
             storageSet("maps.state", "searching");
-            if (coverageView(dir, &la0, &lo0, &z0)) {
+            if (deepestCentre(dir, &la0, &lo0)) {
                 s_viewLat = la0; s_viewLon = lo0; s_haveView = true;
-                base = z0; zoomReq = 0;
-                c->z = base;
-                storageSet("s.maps.zoom", z0);
             } else {
                 s_noTilesDir = dir;
             }
@@ -1297,6 +1282,17 @@ static void wpRowDelCb(lv_event_t* e) {
     wpListRefreshTitle();
 }
 
+static void wpRowGoCb(lv_event_t* e) {
+    WpRow* r = (WpRow*)lv_event_get_user_data(e);
+    portENTER_CRITICAL(&s_ctrlMux);
+    s_gotoLat = r->lat; s_gotoLon = r->lon; s_gotoReq = true;
+    portEXIT_CRITICAL(&s_ctrlMux);
+    wakeWorker();
+    lv_obj_t* l = s_list;
+    s_list = nullptr; s_listTitle = s_listEmpty = nullptr;
+    lv_obj_delete_async(l);
+}
+
 static void mapListCb(lv_event_t*) {
     if (s_list || s_dlg || !s_layer || !s_lastHaveView) return;
 
@@ -1352,9 +1348,13 @@ static void mapListCb(lv_event_t*) {
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row, wpRowFree, LV_EVENT_DELETE, r);
+        lv_obj_add_event_cb(row, wpRowGoCb, LV_EVENT_CLICKED, r);
+        lv_obj_add_event_cb(row, wpListKey, LV_EVENT_KEY, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
         lv_obj_t* col = lv_obj_create(row);
         lv_obj_remove_style_all(col);
+        lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_height(col, LV_SIZE_CONTENT);
         lv_obj_set_flex_grow(col, 1);
         lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
@@ -1403,11 +1403,17 @@ static lv_obj_t* makeGreyBtn(lv_obj_t* parent, const char* label, int yoff, lv_e
     return b;
 }
 
-static void mapsBuild(lv_obj_t* layer) {
-    int W = lv_obj_get_content_width(layer);
-    int H = lv_obj_get_content_height(layer);
+static void mapsBuild(lv_obj_t* root) {
+    lv_obj_update_layout(root);
+    int W = lv_obj_get_content_width(root);
+    int H = lv_obj_get_content_height(root);
     if (W <= 0) W = 320;
     if (H <= 0) H = 240;
+
+    lv_obj_t* layer = lv_obj_create(root);
+    lv_obj_remove_style_all(layer);
+    lv_obj_set_size(layer, lv_pct(100), lv_pct(100));
+    lv_obj_clear_flag(layer, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN));
 
     uint32_t stride = lv_draw_buf_width_to_stride((uint32_t)W, LV_COLOR_FORMAT_RGB565);
     s_canvasBuf = (uint16_t*)heap_caps_malloc((size_t)stride * H, MALLOC_CAP_SPIRAM);
@@ -1419,6 +1425,7 @@ static void mapsBuild(lv_obj_t* layer) {
     lv_canvas_fill_bg(s_canvas, lv_color_hex(0x808080), LV_OPA_COVER);
     lv_obj_center(s_canvas);
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);    /* so it gets press/drag */
+    lv_obj_clear_flag(s_canvas, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN));
     lv_obj_add_event_cb(s_canvas, mapPressCb, LV_EVENT_PRESSING, nullptr);
     lcdProgramScrollHandler(mapsScrollCb);   /* trackball edge-pan -> map pan */
 
@@ -1451,6 +1458,8 @@ static void mapsBuild(lv_obj_t* layer) {
     lv_obj_t* bl = lv_label_create(btn);
     lv_label_set_text(bl, LV_SYMBOL_GPS);
     lv_obj_center(bl);
+    if (!s_haveCenter) lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+    s_centerBtn = btn;
 
     /* "waypoint list" button, above the save button */
     lv_obj_t* lbtn = lv_button_create(layer);
@@ -1519,7 +1528,7 @@ void MapsApp::onClose() {
     s_open = false; wakeWorker();   /* the worker saves the view centre */
     storageSet("lcd.multi_touch", 0);
     if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
-    s_canvas = nullptr; s_label = nullptr;
+    s_canvas = nullptr; s_label = nullptr; s_centerBtn = nullptr;
     s_layer = nullptr; s_dlg = nullptr; s_dlgTa = nullptr;
     s_list = nullptr; s_listTitle = nullptr; s_listEmpty = nullptr;
     for (auto& l : s_wpLbl) l = nullptr;
