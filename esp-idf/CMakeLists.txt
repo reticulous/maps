@@ -13,4 +13,5 @@ idf_component_register(
         ${SPANGAP_REQUIRES}
     PRIV_REQUIRES
         espressif__esp_jpeg
+        json
 )

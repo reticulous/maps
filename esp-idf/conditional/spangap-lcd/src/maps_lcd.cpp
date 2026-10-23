@@ -24,7 +24,16 @@
  *   - lcd task: owns the LVGL canvas + the centre-me button + the drag handler.
  *     composite() blits cached tiles (scaled for overzoom) into the canvas,
  *     draws the marker, toggles a status label.
- * The cache is shared (s_mux); pan/recentre flags are shared (s_ctrlMux).
+ * The cache is shared (s_mux); pan/recentre flags and the waypoint edit queue
+ * are shared (s_ctrlMux); the waypoint list is shared (s_wpMux), and only the
+ * worker changes it or writes its file.
+ *
+ *   - Waypoints: pan so the crosshair sits on a spot (or stay on the GPS fix),
+ *     press the save button, type a name (T-Deck keyboard) and it is stored in
+ *     <parent of tiledir>/waypoints.json — i.e. next to the maps/ folder on the
+ *     SD card. They draw as amber pins with a name label, distinct from the red
+ *     GPS dot. Saving with the crosshair on an existing pin renames it; the
+ *     dialog then also offers Delete. `maps wp` lists / adds / deletes from the CLI.
  *
  * Config:    s.maps.zoom, s.maps.tiledir
  * Ephemeral: maps.state   ("ready" | "no tiles" | "no fix" | "no sd")
@@ -38,9 +47,11 @@
 #include "spangap.h"
 
 #include "lcd.h"          /* pulls in lvgl.h */
+#include "lcd_input.h"    /* lcdInputGroup — keyboard focus group */
 #include "lcd_app.h"      /* LcdApp + lcdInstall */
 #include "maps_app.h"     /* MapsApp — this straddle's services: class */
 #include "fs.h"
+#include "cJSON.h"
 #include "storage.h"
 
 #include "freertos/FreeRTOS.h"
@@ -56,6 +67,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <strings.h>
 
 static const char* TAG = "maps";
 
@@ -65,6 +77,14 @@ static const char* TAG = "maps";
 #define MAPS_MAXK    6          /* max ancestor levels for overzoom fallback */
 #define ZOOM_MIN     1
 #define ZOOM_MAX     19
+
+#define WP_MAX       200        /* saved waypoints */
+#define WP_NAME      63         /* name bytes (textarea caps it at WP_NAME_CHARS chars) */
+#define WP_NAME_CHARS 24
+#define WP_VIS       24         /* waypoints drawn per frame */
+#define WP_LABELS    8          /* of those, how many get a name label (nearest first) */
+#define WP_NEAR_PX   14         /* crosshair "is on this pin" radius, screen px */
+#define WP_FILE      "waypoints.json"
 
 /* ─────────────── worker/config state (worker task owns) ─────────────── */
 
@@ -84,6 +104,31 @@ static long         s_panDx = 0, s_panDy = 0;   /* accumulated drag, screen px *
 static bool         s_recenter = false;
 static int          s_zoomReq  = 0;             /* accumulated +/- button steps */
 
+/* Waypoint edits: lcd task / CLI -> worker, a short queue under s_ctrlMux. The
+ * worker makes every change to the list and every write of the file. A pin is
+ * named by what the requester saw (name + coordinates), never by "whatever is
+ * under the crosshair now", so a map that moved meanwhile can't redirect it. */
+enum { WPR_ADD = 1, WPR_RENAME, WPR_DELETE, WPR_DELNAME };
+struct WpReq {
+    int    kind;
+    char   name[WP_NAME + 1];   /* ADD/RENAME: the new name; DELNAME: the name to drop */
+    char   was[WP_NAME + 1];    /* RENAME/DELETE: the pin's name */
+    double lat, lon;            /* ADD: where; RENAME/DELETE: the pin's position */
+    bool   atView;              /* ADD: at the view centre when handled (CLI) */
+};
+#define WP_REQS 8
+static WpReq s_wpReqQ[WP_REQS];
+static int   s_wpReqHead = 0, s_wpReqLen = 0;
+
+/* ─────────────── waypoints (guarded by s_wpMux; only the worker writes) ─────────────── */
+
+struct Waypoint { char name[WP_NAME + 1]; double lat, lon; };
+PSRAM_BSS static Waypoint s_wp[WP_MAX] = {};
+static int               s_wpCount = 0;
+static SemaphoreHandle_t s_wpMux = nullptr;
+static std::string       s_wpPath;          /* file the list was loaded from ("" = not loaded) */
+static bool              s_wpBroken = false; /* file there but unreadable: never overwrite it */
+
 /* ─────────────── lcd-task-owned widgets (set in mapsApp) ─────────────── */
 
 static lv_obj_t* s_canvas    = nullptr;
@@ -97,6 +142,22 @@ static lv_obj_t*   s_zoomWidget    = nullptr;
 static lv_obj_t*   s_zoomLabel     = nullptr;
 static lv_timer_t* s_zoomHideTimer = nullptr;
 
+static lv_obj_t* s_layer = nullptr;                   /* app root, parent of the dialog */
+static lv_obj_t* s_wpLbl[WP_LABELS] = {};             /* waypoint name labels */
+static lv_obj_t* s_dlg = nullptr;                     /* save-waypoint dialog (null = closed) */
+static lv_obj_t* s_dlgTa = nullptr;
+static lv_obj_t* s_list      = nullptr;                   /* waypoint list panel (null = closed) */
+static lv_obj_t* s_listTitle = nullptr;
+static lv_obj_t* s_listEmpty = nullptr;
+static int       s_listCount = 0;
+static double    s_lastViewLat = 0, s_lastViewLon = 0;   /* centre of the last composite */
+static bool      s_lastHaveView = false;
+static char      s_lastNear[WP_NAME + 1] = {};        /* pin under the crosshair, if any */
+static double    s_lastNearLat = 0, s_lastNearLon = 0;
+static double    s_dlgLat = 0, s_dlgLon = 0;          /* what the open dialog acts on */
+static char      s_dlgWas[WP_NAME + 1] = {};          /* "" = new pin, else the pin being edited */
+static double    s_dlgWasLat = 0, s_dlgWasLon = 0;
+
 /* ─────────────── tile cache (shared, guarded by s_mux) ─────────────── */
 
 struct TileBuf { int z, x, y; bool valid; uint16_t* px; uint32_t lru; };
@@ -106,7 +167,16 @@ static uint32_t          s_lruClock = 0;
 
 /* composite request, heap-passed to the lcd task */
 enum { MAPS_OK = 0, MAPS_NOFIX, MAPS_NOTILES, MAPS_NOSD };
-struct Composite { long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; bool zoomChanged; };
+struct WpVis { short x, y; char name[WP_NAME + 1]; };
+struct Composite {
+    long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; bool zoomChanged;
+    double viewLat, viewLon;       /* map centre (what a save would store) */
+    bool   cross;                  /* free-panned: draw the crosshair */
+    int    nvis; WpVis vis[WP_VIS];            /* visible waypoints, nearest-to-centre first */
+    char   nearName[WP_NAME + 1];  /* pin under the crosshair ("" = none) */
+    double nearLat, nearLon;
+    char   toast[40];              /* one-shot pill text ("" = none) */
+};
 
 /* ─────────────── slippy-map math ─────────────── */
 
@@ -126,6 +196,243 @@ static void globalPxToLonLat(double gx, double gy, int z, double* lon, double* l
     *lon = gx / TILE / n * 360.0 - 180.0;
     double m = M_PI * (1.0 - 2.0 * (gy / TILE / n));
     *lat = atan(sinh(m)) * 180.0 / M_PI;
+}
+
+/* ─────────────── waypoints: storage ─────────────── */
+
+/* The list lives in <parent of s.maps.tiledir>/waypoints.json — next to the
+ * maps/ folder, on the same card (the tile dir defaults to /sdcard/maps). */
+static std::string wpFilePath(const std::string& tiledir) {
+    std::string d = tiledir;
+    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    size_t sl = d.rfind('/');
+    std::string parent = (sl == std::string::npos) ? std::string("/sdcard")
+                       : (sl == 0 ? std::string("/") : d.substr(0, sl));
+    if (parent.back() != '/') parent += '/';
+    return parent + WP_FILE;
+}
+
+/* Copy src -> dst (cap WP_NAME bytes, never cutting a UTF-8 sequence), dropping
+ * control chars and trimming surrounding spaces. */
+static void wpCopyName(char* dst, const char* src) {
+    while (*src == ' ') src++;
+    size_t n = 0;
+    for (; *src && n < WP_NAME; src++)
+        if ((unsigned char)*src >= 0x20 && *src != 0x7f) dst[n++] = *src;
+    while (n && dst[n - 1] == ' ') n--;
+    while (n && n == WP_NAME && ((unsigned char)dst[n - 1] & 0xC0) == 0x80) n--;   /* tail of a cut sequence */
+    if (n && (unsigned char)dst[n - 1] >= 0xC0) n--;                                /* orphaned lead byte */
+    dst[n] = 0;
+}
+
+/* Parse the file's text into list (WP_MAX entries); false if it isn't a
+ * {"waypoints":[...]} object. Entries without both coordinates are skipped and
+ * fields other than name/lat/lon ignored, so a hand-edited file loads whatever
+ * it holds; *dropped counts entries past WP_MAX. */
+static bool wpParse(const char* text, Waypoint* list, int* n, int* dropped) {
+    *n = 0; *dropped = 0;
+    cJSON* root = cJSON_Parse(text);
+    const cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "waypoints");
+    bool ok = cJSON_IsArray(arr);
+    if (ok) {
+        const cJSON* it;
+        cJSON_ArrayForEach(it, arr) {
+            const cJSON* lat = cJSON_GetObjectItemCaseSensitive(it, "lat");
+            const cJSON* lon = cJSON_GetObjectItemCaseSensitive(it, "lon");
+            const cJSON* nm  = cJSON_GetObjectItemCaseSensitive(it, "name");
+            if (!cJSON_IsNumber(lat) || !cJSON_IsNumber(lon)) continue;
+            if (*n >= WP_MAX) { (*dropped)++; continue; }
+            Waypoint& w = list[(*n)++];
+            w = {};
+            if (cJSON_IsString(nm)) wpCopyName(w.name, nm->valuestring);
+            w.lat = lat->valuedouble; w.lon = lon->valuedouble;
+        }
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+/* Read and parse one file into list: 0 = no such file, 1 = parsed (an empty
+ * file is an empty list), -1 = there but not readable as the list. */
+static int wpReadFile(const std::string& file, Waypoint* list, int* n, int* dropped) {
+    *n = 0; *dropped = 0;
+    struct stat st;
+    if (fs_stat(file.c_str(), &st) != 0) return 0;
+    if (st.st_size == 0) return 1;
+    if (st.st_size < 0 || st.st_size > 128 * 1024) return -1;
+    size_t len = (size_t)st.st_size;
+    char* buf = (char*)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) return -1;
+    int f = fs_open(file.c_str(), "rb");
+    size_t got = 0;
+    if (f >= 0) { got = fs_read(buf, 1, len, f); fs_close(f); }
+    buf[got] = 0;
+    bool ok = got == len && wpParse(buf, list, n, dropped);
+    free(buf);
+    return ok ? 1 : -1;
+}
+
+/* Load the list kept at `path` (worker task). A missing file is an empty list.
+ * wpWrite removes the old file before renaming the new one into place, so a
+ * pull-out between the two leaves only a complete .tmp: with no file, a .tmp
+ * that parses is taken and renamed into place, and one that doesn't is a write
+ * that never finished and is removed. A file that is there but can't be read
+ * as the list (or holds more than WP_MAX) sets s_wpBroken, and no edit then
+ * overwrites what the user may still want out of it. */
+static void wpLoad(const std::string& path) {
+    Waypoint* list = (Waypoint*)heap_caps_calloc(WP_MAX, sizeof(Waypoint), MALLOC_CAP_SPIRAM);
+    int n = 0, dropped = 0;
+    int r = list ? wpReadFile(path, list, &n, &dropped) : -1;
+    if (r == 0) {
+        std::string tmp = path + ".tmp";
+        int t = wpReadFile(tmp, list, &n, &dropped);
+        if (t == 1) {
+            if (fs_rename(tmp.c_str(), path.c_str()) == 0) info("recovered %s from its .tmp", path.c_str());
+        } else if (t < 0) {
+            fs_remove(tmp.c_str());
+            n = dropped = 0;
+        }
+    }
+    if (r < 0)       warn("%s: not a waypoint list; showing none and leaving the file alone\n", path.c_str());
+    if (dropped > 0) warn("%s: %d waypoint(s) past the cap of %d not shown; leaving the file alone\n",
+                          path.c_str(), dropped, WP_MAX);
+    xSemaphoreTake(s_wpMux, portMAX_DELAY);
+    s_wpPath   = path;
+    s_wpBroken = r < 0 || dropped > 0;
+    s_wpCount  = r < 0 ? 0 : n;
+    if (s_wpCount) memcpy(s_wp, list, sizeof(Waypoint) * s_wpCount);
+    xSemaphoreGive(s_wpMux);
+    free(list);
+    info("loaded %d waypoint(s) from %s", s_wpCount, path.c_str());
+}
+
+/* The list as file text, one waypoint per line so it stays easy to edit by
+ * hand (caller holds s_wpMux, frees the result). Names hold no control
+ * characters (wpCopyName), so quote and backslash are all that need escaping. */
+static char* wpSerialise(size_t* len) {
+    size_t cap = (size_t)s_wpCount * (WP_NAME * 2 + 64) + 64;
+    char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!buf) return nullptr;
+    size_t n = 0;
+    n += snprintf(buf + n, cap - n, "{\"waypoints\":[\n");
+    for (int i = 0; i < s_wpCount; i++) {
+        char esc[WP_NAME * 2 + 1]; size_t e = 0;
+        for (const char* q = s_wp[i].name; *q; q++) {
+            if (*q == '"' || *q == '\\') esc[e++] = '\\';
+            esc[e++] = *q;
+        }
+        esc[e] = 0;
+        n += snprintf(buf + n, cap - n, "  {\"name\":\"%s\",\"lat\":%.7f,\"lon\":%.7f}%s\n",
+                      esc, s_wp[i].lat, s_wp[i].lon, i + 1 < s_wpCount ? "," : "");
+    }
+    n += snprintf(buf + n, cap - n, "]}\n");
+    *len = n;
+    return buf;
+}
+
+/* Write text to path via path.tmp + rename (worker task, no lock held). FATFS
+ * rename won't replace a file, so the old one is removed first; wpLoad covers
+ * a pull-out between the two. All SD access goes through the fs worker (this
+ * task's stack is in PSRAM, so no raw stdio). */
+static bool wpWrite(const std::string& path, const char* text, size_t len) {
+    std::string tmp = path + ".tmp";
+    int f = fs_open(tmp.c_str(), "wb");
+    bool ok = false;
+    if (f >= 0) {
+        ok = (fs_write(text, 1, len, f) == len) && (fs_sync(f) == 0);
+        fs_close(f);
+    }
+    if (ok) {
+        fs_remove(path.c_str());
+        ok = fs_rename(tmp.c_str(), path.c_str()) == 0;
+    }
+    if (!ok) { warn("saving %s failed\n", path.c_str()); fs_remove(tmp.c_str()); }
+    return ok;
+}
+
+/* ─────────────── waypoints: edits (worker task, caller holds s_wpMux) ─────────────── */
+
+/* The pin a requester saw: same name, same place (the file keeps 7 decimals). */
+static int wpFind(const char* name, double lat, double lon) {
+    for (int i = 0; i < s_wpCount; i++)
+        if (!strcmp(s_wp[i].name, name) && fabs(s_wp[i].lat - lat) < 1e-6 && fabs(s_wp[i].lon - lon) < 1e-6)
+            return i;
+    return -1;
+}
+
+/* A name typed at the CLI: case doesn't matter. */
+static int wpFindName(const char* name) {
+    for (int i = 0; i < s_wpCount; i++)
+        if (!strcasecmp(s_wp[i].name, name)) return i;
+    return -1;
+}
+
+static void wpRemoveAt(int i) {
+    memmove(&s_wp[i], &s_wp[i + 1], (size_t)(s_wpCount - i - 1) * sizeof(Waypoint));
+    s_wpCount--;
+}
+
+/* "WP <n>", lowest n not already taken. */
+static void wpAutoName(char* out) {
+    for (int k = 1; ; k++) {
+        snprintf(out, WP_NAME + 1, "WP %d", k);
+        if (wpFindName(out) < 0) return;
+    }
+}
+
+/* Apply one queued edit; true if the list changed. toast gets the pill text. */
+static bool wpApply(const WpReq& q, char* toast, size_t cap) {
+    char nm[WP_NAME + 1];
+    wpCopyName(nm, q.name);
+    if (q.kind == WPR_ADD) {
+        if (s_wpCount >= WP_MAX) { snprintf(toast, cap, "Waypoints full (%d)", WP_MAX); return false; }
+        if (!nm[0]) wpAutoName(nm);
+        Waypoint& w = s_wp[s_wpCount++];
+        snprintf(w.name, sizeof w.name, "%s", nm);
+        w.lat = q.atView ? s_viewLat : q.lat;
+        w.lon = q.atView ? s_viewLon : q.lon;
+        snprintf(toast, cap, "Saved: %.24s", nm);
+        return true;
+    }
+    if (q.kind == WPR_RENAME) {
+        int i = wpFind(q.was, q.lat, q.lon);
+        if (i < 0 || !nm[0] || !strcmp(s_wp[i].name, nm)) return false;
+        snprintf(s_wp[i].name, sizeof s_wp[i].name, "%s", nm);
+        snprintf(toast, cap, "Renamed: %.24s", nm);
+        return true;
+    }
+    int i = q.kind == WPR_DELETE ? wpFind(q.was, q.lat, q.lon) : wpFindName(nm);
+    if (i < 0) return false;
+    snprintf(toast, cap, "Deleted: %.24s", s_wp[i].name);
+    wpRemoveAt(i);
+    return true;
+}
+
+/* Take the oldest queued edit, if any. */
+static bool wpPop(WpReq* q) {
+    bool got = false;
+    portENTER_CRITICAL(&s_ctrlMux);
+    if (s_wpReqLen) {
+        *q = s_wpReqQ[s_wpReqHead];
+        s_wpReqHead = (s_wpReqHead + 1) % WP_REQS;
+        s_wpReqLen--;
+        got = true;
+    }
+    portEXIT_CRITICAL(&s_ctrlMux);
+    return got;
+}
+
+/* Index of the waypoint nearest (cx,cy) on screen within maxPx, or -1. */
+static int wpNearest(int zoom, long tlx, long tly, double cx, double cy, double maxPx) {
+    int best = -1; double bd = maxPx * maxPx;
+    for (int i = 0; i < s_wpCount; i++) {
+        double gx, gy;
+        lonlatToGlobalPx(s_wp[i].lon, s_wp[i].lat, zoom, &gx, &gy);
+        double dx = gx - tlx - cx, dy = gy - tly - cy;
+        double d2 = dx * dx + dy * dy;
+        if (d2 <= bd) { bd = d2; best = i; }
+    }
+    return best;
 }
 
 /* ─────────────── tile cache (worker task) ─────────────── */
@@ -281,6 +588,40 @@ static void drawMarker(int cx, int cy) {
         }
 }
 
+/* Waypoint pin: amber teardrop with a dark outline, tip on (cx,cy). Deliberately
+ * unlike the red GPS dot so the two never read as the same thing. */
+static void drawPin(int cx, int cy) {
+    const int hy = cy - 10;                       /* head centre */
+    for (int dy = -7; dy <= 0; dy++) {            /* tail: tapers from the head down to the tip */
+        int y = cy + dy;
+        int hw = (-dy) * 5 / 7;                   /* half-width, 0 at tip */
+        for (int dx = -hw - 1; dx <= hw + 1; dx++) {
+            bool edge = (dx < -hw || dx > hw || dy == 0);
+            putPx(cx + dx, y, edge ? 0x0000 : 0xFD20);
+        }
+    }
+    for (int dy = -7; dy <= 7; dy++)
+        for (int dx = -7; dx <= 7; dx++) {
+            int d2 = dx * dx + dy * dy;
+            if (d2 <= 41) putPx(cx + dx, hy + dy, 0x0000);
+            if (d2 <= 26) putPx(cx + dx, hy + dy, 0xFD20);
+            if (d2 <= 4)  putPx(cx + dx, hy + dy, 0xFFFF);
+        }
+}
+
+/* Crosshair at the map centre while free-panned: shows exactly which point a
+ * save would store. White halo + dark line so it reads on any tile colour. */
+static void drawCrosshair(int cx, int cy) {
+    for (int i = 3; i <= 10; i++) {
+        for (int s = -1; s <= 1; s += 2) {
+            putPx(cx + s * i, cy - 1, 0xFFFF); putPx(cx + s * i, cy + 1, 0xFFFF);
+            putPx(cx - 1, cy + s * i, 0xFFFF); putPx(cx + 1, cy + s * i, 0xFFFF);
+            putPx(cx + s * i, cy, 0x0000);
+            putPx(cx, cy + s * i, 0x0000);
+        }
+    }
+}
+
 /* Rounded zoom-level pill (lcd task). Shown for 2s on any effective-zoom change
  * — +/- buttons, pinch, or auto zoom-out on leaving coverage — then hidden by a
  * one-shot timer. A repeat change just restarts the 2s window. */
@@ -288,11 +629,9 @@ static void zoomHideCb(lv_timer_t* /*t*/) {
     if (s_zoomWidget) lv_obj_add_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
     s_zoomHideTimer = nullptr;   /* one-shot: LVGL frees it after this fires */
 }
-static void showZoomIndicator(int z) {
+static void showPill(const char* text) {
     if (!s_zoomWidget || !s_zoomLabel) return;
-    char buf[12];
-    snprintf(buf, sizeof buf, "z%d", z);
-    lv_label_set_text(s_zoomLabel, buf);
+    lv_label_set_text(s_zoomLabel, text);
     lv_obj_clear_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
     if (s_zoomHideTimer) {
         lv_timer_reset(s_zoomHideTimer);
@@ -300,6 +639,11 @@ static void showZoomIndicator(int z) {
         s_zoomHideTimer = lv_timer_create(zoomHideCb, 2000, nullptr);
         lv_timer_set_repeat_count(s_zoomHideTimer, 1);
     }
+}
+static void showZoomIndicator(int z) {
+    char buf[12];
+    snprintf(buf, sizeof buf, "z%d", z);
+    showPill(buf);
 }
 
 static void composite(void* arg) {
@@ -340,9 +684,29 @@ static void composite(void* arg) {
             }
         xSemaphoreGive(s_mux);
 
+        for (int i = c->nvis - 1; i >= 0; i--)    /* far-to-near so the nearest pin is on top */
+            drawPin(c->vis[i].x, c->vis[i].y);
         if (c->haveFix && c->markerX >= 0 && c->markerX < s_W && c->markerY >= 0 && c->markerY < s_H)
             drawMarker((int)c->markerX, (int)c->markerY);
+        if (c->cross) drawCrosshair(s_W / 2, s_H / 2);
     }
+
+    /* waypoint name labels (nearest WP_LABELS), positioned beside each pin's head */
+    for (int i = 0; i < WP_LABELS; i++) {
+        lv_obj_t* l = s_wpLbl[i];
+        if (!l) continue;
+        if (c->state == MAPS_OK && i < c->nvis) {
+            lv_label_set_text(l, c->vis[i].name);
+            lv_obj_set_pos(l, lv_obj_get_x(s_canvas) + c->vis[i].x + 9, lv_obj_get_y(s_canvas) + c->vis[i].y - 21);
+            lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    s_lastHaveView = (c->state == MAPS_OK);
+    s_lastViewLat = c->viewLat; s_lastViewLon = c->viewLon;
+    snprintf(s_lastNear, sizeof s_lastNear, "%s", c->nearName);
+    s_lastNearLat = c->nearLat; s_lastNearLon = c->nearLon;
 
     const char* msg = nullptr;
     char nofix[112];
@@ -364,7 +728,8 @@ static void composite(void* arg) {
         else     { lv_obj_add_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
     }
 
-    if (c->zoomChanged) showZoomIndicator(c->z);
+    if (c->toast[0])          showPill(c->toast);
+    else if (c->zoomChanged)  showZoomIndicator(c->z);
 
     lv_obj_invalidate(s_canvas);
     free(c);
@@ -466,6 +831,55 @@ static void rebuild(void) {
     long tlx = (long)llround(vgx) - s_W / 2;
     long tly = (long)llround(vgy) - s_H / 2;
     c->tlx = tlx; c->tly = tly; c->state = MAPS_OK;
+    c->viewLat = s_viewLat; c->viewLon = s_viewLon; c->cross = !s_follow;
+
+    /* ── waypoints: (re)load for this tiledir, apply queued edits, collect the visible ──
+     * Edits wait in the queue until a frame gets this far (SD present, a view
+     * to anchor to). The list is changed and serialised under s_wpMux; the SD
+     * write happens after it is released, so the lcd task never waits on it. */
+    {
+        std::string wpPath = wpFilePath(dir);
+        if (wpPath != s_wpPath) wpLoad(wpPath);
+
+        WpReq q;
+        bool changed = false;
+        char* text = nullptr; size_t textLen = 0;
+        const double cx = s_W / 2.0, cy = s_H / 2.0;
+        xSemaphoreTake(s_wpMux, portMAX_DELAY);
+        while (wpPop(&q)) {
+            if (s_wpBroken) { snprintf(c->toast, sizeof c->toast, "Fix %s first", WP_FILE); continue; }
+            changed |= wpApply(q, c->toast, sizeof c->toast);
+        }
+        if (changed) text = wpSerialise(&textLen);
+
+        int nearIdx = wpNearest(zoom, tlx, tly, cx, cy, WP_NEAR_PX);
+        if (nearIdx >= 0) {
+            snprintf(c->nearName, sizeof c->nearName, "%s", s_wp[nearIdx].name);
+            c->nearLat = s_wp[nearIdx].lat; c->nearLon = s_wp[nearIdx].lon;
+        }
+
+        /* visible pins, kept sorted nearest-to-centre (insertion into a tiny array) */
+        double dist[WP_VIS];
+        for (int i = 0; i < s_wpCount; i++) {
+            double gx, gy;
+            lonlatToGlobalPx(s_wp[i].lon, s_wp[i].lat, zoom, &gx, &gy);
+            double mx = gx - tlx, my = gy - tly;
+            if (mx < -12 || mx > s_W + 12 || my < -4 || my > s_H + 24) continue;
+            double d = (mx - cx) * (mx - cx) + (my - cy) * (my - cy);
+            int pos = c->nvis;
+            if (pos == WP_VIS) { if (d >= dist[WP_VIS - 1]) continue; pos = WP_VIS - 1; }
+            else c->nvis++;
+            while (pos > 0 && dist[pos - 1] > d) { dist[pos] = dist[pos - 1]; c->vis[pos] = c->vis[pos - 1]; pos--; }
+            dist[pos] = d;
+            c->vis[pos].x = (short)llround(mx); c->vis[pos].y = (short)llround(my);
+            snprintf(c->vis[pos].name, sizeof c->vis[pos].name, "%s", s_wp[i].name);
+        }
+        xSemaphoreGive(s_wpMux);
+
+        if (changed && !(text && wpWrite(wpPath, text, textLen)))
+            snprintf(c->toast, sizeof c->toast, "Save failed (SD?)");
+        free(text);
+    }
 
     /* marker = GPS pixel relative to top-left (may fall off-screen when panned) */
     double ggx, ggy;
@@ -601,6 +1015,246 @@ static void mapsGesture(const lcd_touch_pt_t* pts, int count) {
     }
 }
 
+/* ─────────────── waypoint dialog (lcd task) ─────────────── */
+
+/* Queue an edit for the worker (lcd task or CLI). false if the queue is full. */
+static bool wpPost(int kind, const char* name, const char* was, double lat, double lon, bool atView = false) {
+    WpReq q = {};
+    q.kind = kind;
+    snprintf(q.name, sizeof q.name, "%s", name ? name : "");
+    snprintf(q.was,  sizeof q.was,  "%s", was ? was : "");
+    q.lat = lat; q.lon = lon; q.atView = atView;
+    bool ok = false;
+    portENTER_CRITICAL(&s_ctrlMux);
+    if (s_wpReqLen < WP_REQS) {
+        s_wpReqQ[(s_wpReqHead + s_wpReqLen) % WP_REQS] = q;
+        s_wpReqLen++;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_ctrlMux);
+    if (ok) wakeWorker();
+    else    warn("waypoint edit dropped: queue full\n");
+    return ok;
+}
+
+static void wpDlgClose(void) {
+    if (s_dlg) { lv_obj_delete(s_dlg); s_dlg = nullptr; s_dlgTa = nullptr; }
+}
+/* Save stores a new pin where the dialog said it would, or renames the pin the
+ * dialog opened on — whatever the map has done since. */
+static void wpDlgSave(lv_event_t*) {
+    if (!s_dlgTa) return;
+    const char* nm = lv_textarea_get_text(s_dlgTa);
+    bool ok = s_dlgWas[0] ? wpPost(WPR_RENAME, nm, s_dlgWas, s_dlgWasLat, s_dlgWasLon)
+                          : wpPost(WPR_ADD, nm, nullptr, s_dlgLat, s_dlgLon);
+    if (!ok) { showPill("Busy, try again"); return; }
+    wpDlgClose();
+}
+static void wpDlgDelete(lv_event_t*) {
+    if (!wpPost(WPR_DELETE, nullptr, s_dlgWas, s_dlgWasLat, s_dlgWasLon)) { showPill("Busy, try again"); return; }
+    wpDlgClose();
+}
+static void wpDlgCancel(lv_event_t*) { wpDlgClose(); }
+static void wpDlgKey(lv_event_t* e) {
+    if (lv_event_get_key(e) == LV_KEY_ESC) wpDlgClose();
+}
+
+static lv_obj_t* wpDlgBtn(lv_obj_t* row, const char* text, lv_event_cb_t cb) {
+    lv_obj_t* b = lv_button_create(row);
+    lv_obj_set_height(b, 28);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    return b;
+}
+
+/* Save button: opens a small panel at the top of the map (so the on-screen
+ * keyboard on touch-only devices, which docks at the bottom, doesn't cover it)
+ * with the centre coordinates, a one-line name field and Save / Delete / Cancel.
+ * On a T-Deck the field is focused straight away, so you just type and press
+ * Enter. If the crosshair is on an existing pin the field is prefilled with its
+ * name: Enter renames it, Delete removes it. The point and the pin are fixed
+ * when the dialog opens. */
+static void mapSaveCb(lv_event_t*) {
+    if (s_dlg || s_list || !s_layer) return;
+    if (!s_lastHaveView) return;   /* nothing on screen to anchor a waypoint to yet */
+    s_dlgLat = s_lastViewLat; s_dlgLon = s_lastViewLon;
+    snprintf(s_dlgWas, sizeof s_dlgWas, "%s", s_lastNear);
+    s_dlgWasLat = s_lastNearLat; s_dlgWasLon = s_lastNearLon;
+
+    s_dlg = lv_obj_create(s_layer);
+    lv_obj_set_size(s_dlg, s_W - 16, LV_SIZE_CONTENT);
+    lv_obj_align(s_dlg, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_set_style_pad_all(s_dlg, 6, 0);
+    lv_obj_set_style_pad_row(s_dlg, 4, 0);
+    lv_obj_set_flex_flow(s_dlg, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_dlg, LV_OBJ_FLAG_SCROLLABLE);
+
+    bool editing = s_dlgWas[0] != 0;
+    lv_obj_t* title = lv_label_create(s_dlg);
+    lv_label_set_text(title, editing ? "Edit waypoint" : "Save waypoint");
+
+    char pos[48];
+    snprintf(pos, sizeof pos, "%.5f, %.5f", editing ? s_dlgWasLat : s_dlgLat, editing ? s_dlgWasLon : s_dlgLon);
+    lv_obj_t* coord = lv_label_create(s_dlg);
+    lv_label_set_text(coord, pos);
+
+    s_dlgTa = lv_textarea_create(s_dlg);
+    lv_textarea_set_one_line(s_dlgTa, true);
+    lv_textarea_set_max_length(s_dlgTa, WP_NAME_CHARS);
+    lv_textarea_set_placeholder_text(s_dlgTa, "Name");
+    lv_obj_set_width(s_dlgTa, lv_pct(100));
+    if (editing) lv_textarea_set_text(s_dlgTa, s_dlgWas);
+    lv_obj_add_event_cb(s_dlgTa, wpDlgSave, LV_EVENT_READY, nullptr);   /* Enter */
+    lv_obj_add_event_cb(s_dlgTa, wpDlgKey, LV_EVENT_KEY, nullptr);      /* Esc */
+    if (lcdInputGroup()) { lv_group_add_obj(lcdInputGroup(), s_dlgTa); lv_group_focus_obj(s_dlgTa); }
+    lcdKeyboardAttach(s_dlgTa);   /* no keys on the device -> a tap types, the check fires READY */
+
+    lv_obj_t* row = lv_obj_create(s_dlg);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 6, 0);
+    wpDlgBtn(row, "Save", wpDlgSave);
+    if (editing) wpDlgBtn(row, "Delete", wpDlgDelete);
+    wpDlgBtn(row, "Cancel", wpDlgCancel);
+}
+
+/* ── waypoint list: every saved pin, with a delete button per row ── */
+
+struct WpRow { double lat, lon; char name[WP_NAME + 1]; bool armed; lv_obj_t* row; lv_obj_t* btnLbl; };
+
+static void wpListClose(void) {
+    if (s_list) { lv_obj_delete(s_list); s_list = nullptr; s_listTitle = s_listEmpty = nullptr; }
+}
+static void wpListCloseCb(lv_event_t*) { wpListClose(); }
+static void wpListKey(lv_event_t* e) {
+    if (lv_event_get_key(e) == LV_KEY_ESC) wpListClose();
+}
+static void wpRowFree(lv_event_t* e) { free(lv_event_get_user_data(e)); }
+
+static void wpListRefreshTitle(void) {
+    if (s_listTitle) {
+        char t[32];
+        snprintf(t, sizeof t, "Waypoints (%d)", s_listCount);
+        lv_label_set_text(s_listTitle, t);
+    }
+    if (s_listEmpty) {
+        if (s_listCount == 0) lv_obj_clear_flag(s_listEmpty, LV_OBJ_FLAG_HIDDEN);
+        else                  lv_obj_add_flag(s_listEmpty, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* First press arms the button ("Sure?"), second deletes — an Enter on a
+ * focused trash button must not be enough on its own. */
+static void wpRowDelCb(lv_event_t* e) {
+    WpRow* r = (WpRow*)lv_event_get_user_data(e);
+    lv_obj_t* btn = lv_event_get_target_obj(e);
+    if (!r->armed) {
+        r->armed = true;
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xC02020), 0);
+        lv_obj_set_width(btn, 56);
+        lv_label_set_text(r->btnLbl, "Sure?");
+        return;
+    }
+    if (!wpPost(WPR_DELETE, nullptr, r->name, r->lat, r->lon)) { showPill("Busy, try again"); return; }
+    lv_obj_t* row = r->row;      /* r is freed by the row's delete event */
+    s_listCount--;
+    lv_obj_delete_async(row);
+    wpListRefreshTitle();
+}
+
+static void mapListCb(lv_event_t*) {
+    if (s_list || s_dlg || !s_layer || !s_lastHaveView) return;
+
+    s_list = lv_obj_create(s_layer);
+    lv_obj_set_size(s_list, s_W - 16, s_H - 16);
+    lv_obj_center(s_list);
+    lv_obj_set_style_pad_all(s_list, 6, 0);
+    lv_obj_set_style_pad_row(s_list, 4, 0);
+    lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* header: title + Close */
+    lv_obj_t* head = lv_obj_create(s_list);
+    lv_obj_remove_style_all(head);
+    lv_obj_set_size(head, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    s_listTitle = lv_label_create(head);
+    lv_obj_t* close = lv_button_create(head);
+    lv_obj_set_height(close, 28);
+    lv_obj_t* cl = lv_label_create(close);
+    lv_label_set_text(cl, "Close");
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(close, wpListCloseCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(close, wpListKey, LV_EVENT_KEY, nullptr);
+
+    /* scrolling body */
+    lv_obj_t* body = lv_obj_create(s_list);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(body, 4, 0);
+    lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_listEmpty = lv_label_create(body);
+    lv_label_set_text(s_listEmpty, "No waypoints saved yet");
+    lv_obj_add_flag(s_listEmpty, LV_OBJ_FLAG_HIDDEN);
+
+    s_listCount = 0;
+    xSemaphoreTake(s_wpMux, portMAX_DELAY);
+    for (int i = 0; i < s_wpCount; i++) {
+        WpRow* r = (WpRow*)calloc(1, sizeof(WpRow));
+        if (!r) break;
+        r->lat = s_wp[i].lat; r->lon = s_wp[i].lon;
+        snprintf(r->name, sizeof r->name, "%s", s_wp[i].name);
+
+        lv_obj_t* row = lv_obj_create(body);
+        r->row = row;
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, wpRowFree, LV_EVENT_DELETE, r);
+
+        lv_obj_t* col = lv_obj_create(row);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_height(col, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(col, 1);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_t* nm = lv_label_create(col);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(nm, lv_pct(100));
+        lv_label_set_text(nm, r->name);
+        lv_obj_t* co = lv_label_create(col);
+        char cb[40];
+        snprintf(cb, sizeof cb, "%.5f, %.5f", r->lat, r->lon);
+        lv_label_set_text(co, cb);
+        lv_obj_set_style_text_color(co, lv_color_hex(0x808080), 0);
+
+        lv_obj_t* del = lv_button_create(row);
+        lv_obj_set_size(del, 36, 28);
+        lv_obj_t* dl = lv_label_create(del);
+        lv_label_set_text(dl, LV_SYMBOL_TRASH);
+        lv_obj_center(dl);
+        r->btnLbl = dl;
+        lv_obj_add_event_cb(del, wpRowDelCb, LV_EVENT_CLICKED, r);
+        lv_obj_add_event_cb(del, wpListKey, LV_EVENT_KEY, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), del);
+        s_listCount++;
+    }
+    xSemaphoreGive(s_wpMux);
+    wpListRefreshTitle();
+
+    /* Close first in the focus order and focused: the safe default for Enter. */
+    if (lcdInputGroup()) { lv_group_add_obj(lcdInputGroup(), close); lv_group_focus_obj(close); }
+}
+
 /* ─────────────── launcher program (lcd task) ─────────────── */
 
 /* A white-background control button, same size/shape/corner as the centre-me
@@ -637,6 +1291,22 @@ static void mapsBuild(lv_obj_t* layer) {
     lv_obj_add_event_cb(s_canvas, mapPressCb, LV_EVENT_PRESSING, nullptr);
     lcdProgramScrollHandler(mapsScrollCb);   /* trackball edge-pan -> map pan */
 
+    s_layer = layer;
+
+    /* waypoint name labels: a small pool, repositioned on every composite */
+    for (int i = 0; i < WP_LABELS; i++) {
+        lv_obj_t* l = lv_label_create(layer);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_max_width(l, 120, 0);
+        lv_obj_set_style_bg_color(l, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(l, LV_OPA_80, 0);
+        lv_obj_set_style_text_color(l, lv_color_black(), 0);
+        lv_obj_set_style_radius(l, 3, 0);
+        lv_obj_set_style_pad_hor(l, 3, 0);
+        lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+        s_wpLbl[i] = l;
+    }
+
     s_label = lv_label_create(layer);
     lv_label_set_text(s_label, "Waiting for GPS...");
     lv_obj_set_style_text_align(s_label, LV_TEXT_ALIGN_CENTER, 0);   /* multi-line status reads centred */
@@ -650,6 +1320,25 @@ static void mapsBuild(lv_obj_t* layer) {
     lv_obj_t* bl = lv_label_create(btn);
     lv_label_set_text(bl, LV_SYMBOL_GPS);
     lv_obj_center(bl);
+
+    /* "waypoint list" button, above the save button */
+    lv_obj_t* lbtn = lv_button_create(layer);
+    lv_obj_set_size(lbtn, 26, 26);
+    lv_obj_align(lbtn, LV_ALIGN_BOTTOM_RIGHT, -8, -72);
+    lv_obj_add_event_cb(lbtn, mapListCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* ll = lv_label_create(lbtn);
+    lv_label_set_text(ll, LV_SYMBOL_LIST);
+    lv_obj_center(ll);
+
+    /* "save waypoint" button, above centre-me. A save glyph, not '+', which is
+     * the zoom-in button's. */
+    lv_obj_t* sbtn = lv_button_create(layer);
+    lv_obj_set_size(sbtn, 26, 26);
+    lv_obj_align(sbtn, LV_ALIGN_BOTTOM_RIGHT, -8, -40);
+    lv_obj_add_event_cb(sbtn, mapSaveCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* sl = lv_label_create(sbtn);
+    lv_label_set_text(sl, LV_SYMBOL_SAVE);
+    lv_obj_center(sl);
 
     /* zoom +/- buttons, stacked in the bottom-left ('+' above '-'). The worker
      * caps the step to the tiles actually present around the view. */
@@ -700,6 +1389,10 @@ void MapsApp::onClose() {
     storageSet("lcd.multi_touch", 0);
     if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
     s_canvas = nullptr; s_label = nullptr;
+    s_layer = nullptr; s_dlg = nullptr; s_dlgTa = nullptr;
+    s_list = nullptr; s_listTitle = nullptr; s_listEmpty = nullptr;
+    for (auto& l : s_wpLbl) l = nullptr;
+    s_lastHaveView = false;
     s_zoomWidget = nullptr; s_zoomLabel = nullptr;
     if (s_canvasBuf) { free(s_canvasBuf); s_canvasBuf = nullptr; }
 }
@@ -711,6 +1404,44 @@ static void cliMaps(const char* args) {
     if (args && cliWantsHelp(args)) {
         cliPrintf("%-*s map status\n",        CLI_HELP_COL, "maps");
         cliPrintf("%-*s recentre on GPS\n",   CLI_HELP_COL, "maps center");
+        cliPrintf("%-*s list / add at view centre / delete waypoints\n", CLI_HELP_COL, "maps wp [add|del <name>]");
+        return;
+    }
+    if (args && strncmp(args, "wp", 2) == 0 && (args[2] == 0 || args[2] == ' ')) {
+        const char* a = args + 2;
+        while (*a == ' ') a++;
+        /* Edits go through the worker's queue like the dialog's; it applies
+         * them on its next frame, at the view centre it holds then. */
+        if (!strncmp(a, "add ", 4)) {
+            if (!s_open) { cliPrintf("open Maps first: a waypoint is saved at its view centre\n"); return; }
+            cliPrintf(wpPost(WPR_ADD, a + 4, nullptr, 0, 0, true) ? "saving at the view centre\n"
+                                                                  : "busy, try again\n");
+            return;
+        }
+        if (!strncmp(a, "del ", 4)) {
+            char nm[WP_NAME + 1];
+            wpCopyName(nm, a + 4);
+            xSemaphoreTake(s_wpMux, portMAX_DELAY);
+            bool found = wpFindName(nm) >= 0;
+            xSemaphoreGive(s_wpMux);
+            if (!found) { cliPrintf("no such waypoint\n"); return; }
+            cliPrintf(wpPost(WPR_DELNAME, nm, nullptr, 0, 0) ? "deleting\n" : "busy, try again\n");
+            return;
+        }
+        /* Copied out under the lock, printed after it. */
+        Waypoint* snap = (Waypoint*)heap_caps_malloc(sizeof(Waypoint) * WP_MAX, MALLOC_CAP_SPIRAM);
+        if (!snap) { cliPrintf("out of memory\n"); return; }
+        xSemaphoreTake(s_wpMux, portMAX_DELAY);
+        int n = s_wpCount;
+        bool broken = s_wpBroken;
+        std::string path = s_wpPath;
+        memcpy(snap, s_wp, sizeof(Waypoint) * n);
+        xSemaphoreGive(s_wpMux);
+        if (path.empty()) cliPrintf("(not loaded yet — open Maps once)\n");
+        else cliPrintf("%d waypoint(s) in %s%s\n", n, path.c_str(),
+                       broken ? " (file unreadable or over the cap: edits refused)" : "");
+        for (int i = 0; i < n; i++) cliPrintf("  %-24s %.6f, %.6f\n", snap[i].name, snap[i].lat, snap[i].lon);
+        free(snap);
         return;
     }
     if (args && strcmp(args, "center") == 0) { mapCenterCb(nullptr); cliPrintf("recentred\n"); return; }
@@ -739,6 +1470,7 @@ void MapsApp::appInit() {
      * has the hardware), and the user owns it thereafter. Forcing it on at every
      * maps init clobbered that choice on every boot. */
     s_mux = xSemaphoreCreateMutex();
+    s_wpMux = xSemaphoreCreateMutex();
     cliRegisterCmd("maps", cliMaps);
     s_worker = spawnTask(mapsWorker, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
 }
