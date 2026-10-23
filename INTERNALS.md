@@ -48,7 +48,8 @@ must be FAT32 anyway).
 
 Why split: SD tile reads are slow (fs worker); doing them on the LCD task would
 stutter the UI. The cache is shared under `s_mux`; control flags (pan delta,
-recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
+recentre, zoom-step) and waypoint edits pass lcd→worker under `s_ctrlMux`; the
+waypoint list is shared under `s_wpMux` (see Waypoints).
 
 ## On-device controls
 
@@ -84,6 +85,43 @@ recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
   upscaling the nearest existing lower-zoom ancestor (searched up to 6 levels up,
   `MAPS_MAXK`), so a coarse base "shows through" instead of going grey (also how
   the bake's edge-dropped tiles render).
+
+## Waypoints
+
+```
+  dialog / list / CLI ──WpReq──▶ queue (s_ctrlMux, 8 deep) ──▶ worker
+                                                                 │ wpApply under s_wpMux
+                                                                 │ wpSerialise under s_wpMux
+                                                                 ▼ wpWrite, lock released
+                                               <parent of tiledir>/waypoints.json
+```
+
+- **One writer.** The list (`s_wp`, PSRAM, `WP_MAX` = 200) lives under
+  `s_wpMux`; the LCD task (list panel) and the CLI (`maps wp`) only read it,
+  holding the lock just long enough to copy. Every change and every file write
+  is the worker's, applied from a small request queue during `rebuild()`, after
+  the view is known. Edits wait in the queue while a frame can't get that far
+  (no SD, no fix). The SD write happens after the lock is released, so the LCD
+  task never waits on the card.
+- **Requests name what the requester saw.** The save dialog fixes the point
+  (view centre) and the pin under the crosshair (name + coordinates) when it
+  opens; rename and delete then act on that pin by name and position
+  (`wpFind`), and a new pin goes where the dialog said, whatever the map has
+  done since. The list deletes the same way. The CLI is the exception: `add`
+  saves at the worker's view centre when it handles the request, and `del`
+  takes a name, case-insensitively (`wpFindName`).
+- **File.** `wpLoad` parses with cJSON and takes `name`/`lat`/`lon`, skipping
+  entries without both coordinates and ignoring other fields. `wpWrite` writes
+  `.tmp`, syncs, removes the old file and renames (FATFS rename won't replace);
+  a pull-out between remove and rename leaves only a complete `.tmp`, which
+  `wpLoad` takes and renames into place when the file itself is missing (a
+  `.tmp` that doesn't parse is an unfinished write and is removed). A file that
+  is there but doesn't parse, or holds more than `WP_MAX`, sets `s_wpBroken`:
+  edits are refused rather than overwrite what the user may still want out of it.
+- **Drawing.** The worker hands the composite the `WP_VIS` pins nearest the
+  centre (screen positions + names) and the one within `WP_NEAR_PX` of the
+  crosshair; the LCD task draws the pins into the canvas and positions a pool of
+  `WP_LABELS` name labels on the nearest.
 
 ## GPS as ephemeral storage
 
