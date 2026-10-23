@@ -417,17 +417,41 @@ static void rebuild(void) {
     }
     if (!s_haveView) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
 
-    /* Effective zoom, capped to where we actually have tiles around the view.
-     * A +/- button step or pinch sets the desired level (base + request); we
-     * never zoom IN past the deepest real tile here, and if we've drifted out of
-     * coverage at the current level we drop down until a real tile reappears.
-     * The capped level is persisted so the slider, the indicator and the next
-     * rebuild all agree on it. */
+    /* Effective zoom: the level nearest the desired one (base + the +/- or
+     * pinch request) at which a real tile exists under the view centre. Levels
+     * at and below the desired one are searched first, so the view never zooms
+     * in past the deepest real tile and, on drifting out of a detailed area's
+     * coverage, drops to the level beneath. If nothing at or below has a tile,
+     * the coarsest level above that does is used, so zooming out stops at the
+     * edge of the baked range. Where no level has a tile (outside the baked
+     * area) the desired level stands, so +/- keep working while the user pans
+     * back. That last search stats every level on the SD card, so its outcome
+     * is remembered for the view's tile at the desired level and not repeated
+     * while panning inside it. The result is persisted so the slider, the
+     * indicator and the next rebuild all agree on it. */
     int zoom = base + zoomReq;
     if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
     if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
-    while (zoom > base     && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
-    while (zoom > ZOOM_MIN && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+    {
+        static std::string s_bareDir;              /* last view tile with no tile at any level */
+        static int         s_bareZ = -1, s_bareX = 0, s_bareY = 0;
+        const int want = zoom;
+        double wgx, wgy;
+        lonlatToGlobalPx(s_viewLon, s_viewLat, want, &wgx, &wgy);
+        const int wtx = (int)floor(wgx / TILE), wty = (int)floor(wgy / TILE);
+        bool bare = s_bareZ == want && s_bareX == wtx && s_bareY == wty && s_bareDir == dir;
+        if (!bare) {
+            while (zoom > ZOOM_MIN && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+            if (!realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) {
+                int z = want + 1;
+                while (z <= ZOOM_MAX && !realTileAt(dir.c_str(), z, s_viewLat, s_viewLon)) z++;
+                bare = z > ZOOM_MAX;
+                zoom = bare ? want : z;
+                if (bare) { s_bareDir = dir; s_bareZ = want; s_bareX = wtx; s_bareY = wty; }
+            }
+        }
+        if (bare) zoom = want;
+    }
     if (zoom != base) storageSet("s.maps.zoom", zoom);
 
     /* Flash the zoom pill only when the level actually changed since last draw

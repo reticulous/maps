@@ -65,11 +65,18 @@ recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
   worker (`s_zoomReq`); pinch instead writes the new *absolute* level straight to
   `s.maps.zoom`, which the worker observes via its `s.maps` subscription. Either
   way the worker re-clamps the result to where real tiles exist (below).
-- **Zoom capped to available data** — the worker only changes to a zoom where a
-  real (non-overzoom) tile exists at the view centre (`realTileAt`, a cache hit
-  or an `fs_stat`). So you can't zoom in past where the SD actually has detail;
-  and if you pan out of a high-zoom area's coverage it **auto-zooms-out** until a
-  real tile reappears. The effective level is persisted to `s.maps.zoom`.
+- **Zoom capped to available data** — the worker uses the level nearest the
+  desired one where a real (non-overzoom) tile exists at the view centre
+  (`realTileAt`, a cache hit or an `fs_stat`), searching at and below the
+  desired level first. So you can't zoom in past where the SD actually has
+  detail; if you pan out of a high-zoom area's coverage it **auto-zooms-out**
+  until a real tile reappears; and if nothing at or below has a tile, the
+  coarsest level above that does is used, so zooming out stops at the edge of
+  the baked range. Outside the baked area altogether the desired level stands,
+  so `+`/`−` keep working while you pan back; that every-level miss is
+  remembered for the view's tile at the desired level, so panning inside it
+  doesn't re-stat the whole zoom range on each step. The effective level is
+  persisted to `s.maps.zoom`.
 - **Zoom pill** — a rounded `z<NN>` overlay (bottom-left, above the buttons)
   flashes for 2 s on any effective-zoom change (button, pinch, or auto-zoom-out),
   hidden by a one-shot LVGL timer.
