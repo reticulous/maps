@@ -417,17 +417,31 @@ static void rebuild(void) {
     }
     if (!s_haveView) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
 
-    /* Effective zoom, capped to where we actually have tiles around the view.
-     * A +/- button step or pinch sets the desired level (base + request); we
-     * never zoom IN past the deepest real tile here, and if we've drifted out of
-     * coverage at the current level we drop down until a real tile reappears.
-     * The capped level is persisted so the slider, the indicator and the next
-     * rebuild all agree on it. */
+    /* Effective zoom, kept inside the levels where we actually have tiles
+     * around the view. A +/- button step or pinch sets the desired level (base
+     * + request). We never zoom IN past the deepest real tile, and if we've
+     * drifted out of coverage at the current level we drop down until a real
+     * tile reappears. Zooming OUT is bounded the same way from the other side:
+     * if nothing at or below the desired level has a tile, the coarsest level
+     * that does is used, so the view stops at the edge of the baked range
+     * instead of running down to z1 — a blank map the zoom-in cap above could
+     * then never climb out of (every level reads "no tile", so '+' was refused
+     * until s.maps.zoom was reset by hand). If no level has a tile here at all
+     * (outside the baked area), the desired level stands, so +/- keep working
+     * while the user pans back. The result is persisted so the slider, the
+     * indicator and the next rebuild all agree on it. */
     int zoom = base + zoomReq;
     if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
     if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
-    while (zoom > base     && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
-    while (zoom > ZOOM_MIN && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+    {
+        const int want = zoom;
+        while (zoom > ZOOM_MIN && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+        if (!realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) {
+            zoom = want;                                   /* nothing at or below: look for the coarsest above */
+            for (int z = want + 1; z <= ZOOM_MAX; z++)
+                if (realTileAt(dir.c_str(), z, s_viewLat, s_viewLon)) { zoom = z; break; }
+        }
+    }
     if (zoom != base) storageSet("s.maps.zoom", zoom);
 
     /* Flash the zoom pill only when the level actually changed since last draw
