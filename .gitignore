@@ -32,3 +32,6 @@ esp-idf/build/
 pbf/
 out/
 .tilebake-cache/
+
+
+tiles/*
