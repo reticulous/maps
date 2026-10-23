@@ -67,6 +67,27 @@ buttons — zoom is capped to where the SD actually has tiles (it won't zoom int
 blur, and auto-zooms-out if you leave a detailed area's coverage), and a `z<NN>`
 pill flashes for 2 s on each change. See [INTERNALS.md](INTERNALS.md).
 
+## Waypoints
+
+Pan until the crosshair sits on a spot (or stay on the GPS fix), press the
+`+` button above the re-centre button, type a name, press Enter. The spot is
+saved to `waypoints.json` in the **parent of the tile dir** — with the default
+`/sdcard/maps` that is `/sdcard/waypoints.json`, right next to `maps/`:
+
+```json
+{"waypoints":[
+  {"name":"Camp","lat":52.5200000,"lon":13.4050000}
+]}
+```
+
+Waypoints draw as amber pins with a name label, distinct from the red GPS dot.
+With the crosshair on an existing pin the dialog is prefilled: Enter renames it,
+**Delete** removes it.
+The list button (above `+`) shows every saved waypoint with its coordinates; the
+trash button on a row deletes it after a second press ("Sure?"). Esc closes
+the list. The file is plain JSON, so you can also edit it on a
+computer. Cap: 200 waypoints, 24-character names.
+
 ## Storage variables
 
 Settings live under `s.maps.*` and are owned by the straddle.yaml `settings:`
@@ -102,6 +123,7 @@ While the app is open it sets ephemeral `lcd.multi_touch` to `1` (and back to
 ```
 maps           map status — state, sd, zoom, follow/pan, tiledir, GPS & view centres
 maps center    recentre on the GPS fix
+maps wp        list waypoints; `maps wp add <name>` saves at the view centre, `maps wp del <name>` removes
 ```
 
 Run on-device through `spangap cli "<command>"`.
