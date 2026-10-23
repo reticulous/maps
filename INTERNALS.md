@@ -101,7 +101,7 @@ waypoint list is shared under `s_wpMux` (see Waypoints).
   holding the lock just long enough to copy. Every change and every file write
   is the worker's, applied from a small request queue during `rebuild()`, after
   the view is known. Edits wait in the queue while a frame can't get that far
-  (no SD, no fix). The SD write happens after the lock is released, so the LCD
+  (no SD, or no view yet: no fix, no saved centre, no tiles to frame). The SD write happens after the lock is released, so the LCD
   task never waits on the card.
 - **Requests name what the requester saw.** The save dialog fixes the point
   (view centre) and the pin under the crosshair (name + coordinates) when it
@@ -121,7 +121,34 @@ waypoint list is shared under `s_wpMux` (see Waypoints).
 - **Drawing.** The worker hands the composite the `WP_VIS` pins nearest the
   centre (screen positions + names) and the one within `WP_NEAR_PX` of the
   crosshair; the LCD task draws the pins into the canvas and positions a pool of
-  `WP_LABELS` name labels on the nearest.
+  `WP_LABELS` name labels on the nearest. The crosshair shows whenever the view
+  isn't on a GPS fix (panned, or opened without one), since that is when a save
+  stores somewhere other than the user's position.
+
+## Opening without a fix
+
+The view centre comes, in order, from: the GPS fix while following; a pan;
+before either, `s.maps.center` (at `s.maps.zoom`); and on a first open, with no
+saved centre, `coverageView`. The fix takes over when it arrives, unless the
+user has panned (`s_follow` cleared). The acquisition screen shows only when
+none of these yields a view.
+
+- **Saving.** `saveCenter` writes `"lat,lon"` (6 decimals) to `s.maps.center`
+  from the worker, at most every `CENTER_SAVE_MS` (60 s) while open, since GPS
+  follow moves the centre every second, and once on close (`onClose` wakes the
+  worker, which finds `s_open` false). It skips a write when the value is
+  unchanged. `onChange` ignores `s.maps.center`, so the write doesn't trigger a
+  rebuild through the `s.maps` subscription.
+- **First-open framing.** `coverageView` goes down from `ZOOM_MAX`. At each level
+  it adds that level's tile box (`levelExtent`: min/max `x` over the `<z>/`
+  directory names, min/max `y` over the files in each `<z>/<x>/`) to a running
+  box. It stops at the first level where the box fits the canvas, and centres
+  there; `ZOOM_MIN` if it never fits. Because the box only takes in deeper
+  levels first, a detailed bake over a world base frames the detailed area.
+  The listing reads every tile directory, so it runs only while there is no
+  saved centre, behind a "Looking for map tiles..." screen
+  (`maps.state = searching`). A tile dir found empty is remembered
+  (`s_noTilesDir`) and not listed again until the dir changes.
 
 ## GPS as ephemeral storage
 
@@ -130,7 +157,8 @@ live). Today they're written by hw-lilygo-tdeck's `gps.cpp`; any future "GPS ser
 abstraction just needs to write the same keys.
 
 - `gps.lat` / `gps.lon` — WGS84 degrees (the fix the map centres on)
-- `gps.sats_view` / `gps.snr` — shown on the acquisition screen before a fix
+- `gps.sats_view` / `gps.snr` — shown on the acquisition screen (no fix and no
+  saved or framed view)
 
 ## Cache policy
 

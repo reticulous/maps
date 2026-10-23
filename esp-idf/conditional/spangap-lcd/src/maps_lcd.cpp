@@ -11,6 +11,8 @@
  * Features:
  *   - Follows the GPS fix, or free-pan (drag / trackball-drag) with a
  *     "centre me" button to re-lock to GPS.
+ *   - Opens without a fix: at the view it was left at (s.maps.center + zoom),
+ *     or on a first open, framing the tiles baked at the deepest levels.
  *   - Overzoom fallback: a missing tile at the display zoom is filled by
  *     upscaling the nearest existing lower-zoom ancestor, so a coarse base map
  *     "shows through" where local detail is absent instead of going grey.
@@ -35,8 +37,8 @@
  *     GPS dot. Saving with the crosshair on an existing pin renames it; the
  *     dialog then also offers Delete. `maps wp` lists / adds / deletes from the CLI.
  *
- * Config:    s.maps.zoom, s.maps.tiledir
- * Ephemeral: maps.state   ("ready" | "no tiles" | "no fix" | "no sd")
+ * Config:    s.maps.zoom, s.maps.tiledir, s.maps.center (last view, "lat,lon")
+ * Ephemeral: maps.state   ("ready" | "no tiles" | "no fix" | "no sd" | "searching")
  *
  * This whole file lives under conditional/spangap-lcd/, compiled only when the
  * lcd straddle is staged, so no #if is needed. The maps program (worker, CLI,
@@ -77,6 +79,7 @@ static const char* TAG = "maps";
 #define MAPS_MAXK    6          /* max ancestor levels for overzoom fallback */
 #define ZOOM_MIN     1
 #define ZOOM_MAX     19
+#define CENTER_SAVE_MS 60000    /* s.maps.center written at most this often while open */
 
 #define WP_MAX       200        /* saved waypoints */
 #define WP_NAME      63         /* name bytes (textarea caps it at WP_NAME_CHARS chars) */
@@ -166,12 +169,12 @@ static SemaphoreHandle_t s_mux = nullptr;
 static uint32_t          s_lruClock = 0;
 
 /* composite request, heap-passed to the lcd task */
-enum { MAPS_OK = 0, MAPS_NOFIX, MAPS_NOTILES, MAPS_NOSD };
+enum { MAPS_OK = 0, MAPS_NOFIX, MAPS_NOTILES, MAPS_NOSD, MAPS_SEARCHING };
 struct WpVis { short x, y; char name[WP_NAME + 1]; };
 struct Composite {
     long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; bool zoomChanged;
     double viewLat, viewLon;       /* map centre (what a save would store) */
-    bool   cross;                  /* free-panned: draw the crosshair */
+    bool   cross;                  /* view isn't on the GPS fix: draw the crosshair */
     int    nvis; WpVis vis[WP_VIS];            /* visible waypoints, nearest-to-centre first */
     char   nearName[WP_NAME + 1];  /* pin under the crosshair ("" = none) */
     double nearLat, nearLon;
@@ -548,6 +551,107 @@ static bool realTileAt(const char* dir, int z, double lat, double lon) {
     return false;
 }
 
+/* ─────────────── last view and first-open view (worker task) ─────────────── */
+
+/* The view centre is kept in s.maps.center ("lat,lon") so the map opens where it
+ * was left, fix or no fix. GPS follow moves it every second, so it is written at
+ * most every CENTER_SAVE_MS while the map is open, and once more on close. */
+static std::string s_savedCenter;          /* last value written */
+static uint32_t    s_centerSavedMs = 0;
+
+static bool loadCenter(double* lat, double* lon) {
+    std::string v = storageGetStr("s.maps.center", "");
+    const char* p = v.c_str();
+    char* e;
+    *lat = strtod(p, &e);
+    if (e == p || *e != ',') return false;
+    p = e + 1;
+    *lon = strtod(p, &e);
+    return e != p;
+}
+
+static void saveCenter(bool now) {
+    if (!s_haveView) return;
+    uint32_t t = millis();
+    if (!now && s_centerSavedMs && t - s_centerSavedMs < CENTER_SAVE_MS) return;
+    char v[48];
+    snprintf(v, sizeof v, "%.6f,%.6f", s_viewLat, s_viewLon);
+    if (s_savedCenter == v) return;
+    storageSet("s.maps.center", v);
+    s_savedCenter = v;
+    s_centerSavedMs = t;
+}
+
+/* A tile-tree entry name as a number: digits, then the end (a <z> or <x>
+ * directory) or ".jpg"/".bin" (a <y> tile). */
+static bool tileNum(const char* s, int* v) {
+    if (*s < '0' || *s > '9') return false;
+    char* e;
+    long n = strtol(s, &e, 10);
+    if (*e && strcmp(e, ".jpg") && strcmp(e, ".bin")) return false;
+    *v = (int)n;
+    return true;
+}
+
+/* What zoom level z holds, as a box in world units (0..1 across the Mercator
+ * square); false if it holds no tiles. */
+struct Extent { double x0, y0, x1, y1; };
+
+static bool levelExtent(const std::string& dir, int z, Extent* out) {
+    std::string zd = dir + "/" + std::to_string(z);
+    int dz = fs_opendir(zd.c_str());
+    if (dz < 0) return false;
+    int x0 = INT32_MAX, x1 = -1, y0 = INT32_MAX, y1 = -1;
+    fs_dirent_t xe, ye;
+    while (fs_readdir(dz, &xe)) {
+        int x, y;
+        if (!tileNum(xe.name, &x)) continue;
+        int dx = fs_opendir((zd + "/" + xe.name).c_str());
+        if (dx < 0) continue;
+        bool any = false;
+        while (fs_readdir(dx, &ye)) {
+            if (!tileNum(ye.name, &y)) continue;
+            any = true;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+        }
+        fs_closedir(dx);
+        if (any) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
+    }
+    fs_closedir(dz);
+    if (x1 < 0) return false;
+    const double n = (double)(1u << z);
+    *out = { x0 / n, y0 / n, (x1 + 1) / n, (y1 + 1) / n };
+    return true;
+}
+
+/* First open, with no saved centre: the deepest zoom at which everything baked
+ * at that level and deeper fits on the screen, centred on it. Going down from
+ * ZOOM_MAX the box only grows, a level at a time, so a city baked to z16 over a
+ * world base baked to z7 frames the city: the world joins the box only below
+ * z8, by which point the city fits. false if the tile dir holds no tiles. This
+ * lists every tile directory, so it runs only while there is no saved centre. */
+static bool coverageView(const std::string& dir, double* lat, double* lon, int* zoom) {
+    Extent u = {};
+    bool have = false;
+    for (int z = ZOOM_MAX; z >= ZOOM_MIN; z--) {
+        Extent e;
+        if (levelExtent(dir, z, &e)) {
+            if (!have) u = e;
+            else u = { fmin(u.x0, e.x0), fmin(u.y0, e.y0), fmax(u.x1, e.x1), fmax(u.y1, e.y1) };
+            have = true;
+        }
+        if (!have) continue;
+        const double px = (double)TILE * (double)(1u << z);
+        if (((u.x1 - u.x0) * px <= s_W && (u.y1 - u.y0) * px <= s_H) || z == ZOOM_MIN) {
+            globalPxToLonLat((u.x0 + u.x1) / 2 * TILE, (u.y0 + u.y1) / 2 * TILE, 0, lon, lat);
+            *zoom = z;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ─────────────── compositing (lcd task) ─────────────── */
 
 static inline void putPx(int x, int y, uint16_t c) {
@@ -712,6 +816,8 @@ static void composite(void* arg) {
     char nofix[112];
     if (c->state == MAPS_NOSD) {
         msg = "No SD card";
+    } else if (c->state == MAPS_SEARCHING) {
+        msg = "Looking for map tiles...";
     } else if (c->state == MAPS_NOFIX) {
         /* Acquisition screen: nudge the user to improve the sky view, with the live
          * satellite count + best signal so progress toward a fix is visible. */
@@ -738,7 +844,7 @@ static void composite(void* arg) {
 /* ─────────────── rebuild (worker task) ─────────────── */
 
 static void rebuild(void) {
-    if (!s_open) return;   /* program not on screen yet — nothing to draw */
+    if (!s_open) { saveCenter(true); return; }   /* closed (onClose wakes us): keep where it was left */
 
     int base = storageGetInt("s.maps.zoom", 15);
     if (base < ZOOM_MIN) base = ZOOM_MIN;
@@ -770,17 +876,38 @@ static void rebuild(void) {
     c->z = base; c->markerX = -1; c->markerY = -1; c->haveFix = fix;
 
     if (!sdAvailable()) { c->state = MAPS_NOSD;  storageSet("maps.state", "no sd");  lcdRun(composite, c); return; }
-    if (!s_haveCenter)  { c->state = MAPS_NOFIX; storageSet("maps.state", "no fix"); lcdRun(composite, c); return; }
 
-    /* view centre: GPS when following, else free-panned (pan is in old-zoom px) */
-    if (s_follow) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
+    /* View centre: GPS while following and there is a fix; free-panned (pan is
+     * in old-zoom px); before either, where the map was left (s.maps.center at
+     * s.maps.zoom), or on a first open the view framing the baked tiles. The
+     * fix takes over when it arrives unless the user has panned since. */
+    static std::string s_noTilesDir;   /* tile dir a first-open search found empty */
+    if (s_follow && s_haveCenter) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
+    else if (!s_haveView) {
+        double la0, lo0; int z0;
+        if (loadCenter(&la0, &lo0)) {
+            s_viewLat = la0; s_viewLon = lo0; s_haveView = true;
+        } else if (dir != s_noTilesDir) {
+            Composite* wait = (Composite*)gp_alloc(sizeof(Composite));
+            if (wait) { *wait = {}; wait->state = MAPS_SEARCHING; lcdRun(composite, wait); }
+            storageSet("maps.state", "searching");
+            if (coverageView(dir, &la0, &lo0, &z0)) {
+                s_viewLat = la0; s_viewLon = lo0; s_haveView = true;
+                base = z0; zoomReq = 0;
+                c->z = base;
+                storageSet("s.maps.zoom", z0);
+            } else {
+                s_noTilesDir = dir;
+            }
+        }
+    }
     else if (dx || dy) {
         double gx, gy;
         lonlatToGlobalPx(s_viewLon, s_viewLat, base, &gx, &gy);
         gx -= dx; gy -= dy;     /* drag the map under the finger */
         globalPxToLonLat(gx, gy, base, &s_viewLon, &s_viewLat);
     }
-    if (!s_haveView) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
+    if (!s_haveView) { c->state = MAPS_NOFIX; storageSet("maps.state", "no fix"); lcdRun(composite, c); return; }
 
     /* Effective zoom: the level nearest the desired one (base + the +/- or
      * pinch request) at which a real tile exists under the view centre. Levels
@@ -831,7 +958,7 @@ static void rebuild(void) {
     long tlx = (long)llround(vgx) - s_W / 2;
     long tly = (long)llround(vgy) - s_H / 2;
     c->tlx = tlx; c->tly = tly; c->state = MAPS_OK;
-    c->viewLat = s_viewLat; c->viewLon = s_viewLon; c->cross = !s_follow;
+    c->viewLat = s_viewLat; c->viewLon = s_viewLon; c->cross = !(s_follow && s_haveCenter);
 
     /* ── waypoints: (re)load for this tiledir, apply queued edits, collect the visible ──
      * Edits wait in the queue until a frame gets this far (SD present, a view
@@ -899,6 +1026,7 @@ static void rebuild(void) {
 
     storageSet("maps.state", present ? "ready" : "no tiles");
     lcdRun(composite, c);
+    saveCenter(false);
 }
 
 static void wakeWorker(void) {
@@ -906,7 +1034,10 @@ static void wakeWorker(void) {
     if (s_worker) xTaskNotifyGive(s_worker);
 }
 
-static void onChange(const char* /*k*/, const char* /*v*/) { wakeWorker(); }
+static void onChange(const char* k, const char* /*v*/) {
+    if (k && strcmp(k, "s.maps.center") == 0) return;   /* our own write; the view already has it */
+    wakeWorker();
+}
 
 static void mapsWorker(void*) {
     info("task up");
@@ -1385,7 +1516,7 @@ void MapsApp::onShow() {
 }
 
 void MapsApp::onClose() {
-    s_open = false;
+    s_open = false; wakeWorker();   /* the worker saves the view centre */
     storageSet("lcd.multi_touch", 0);
     if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
     s_canvas = nullptr; s_label = nullptr;

@@ -67,6 +67,14 @@ buttons — zoom is capped to where the SD actually has tiles (it won't zoom int
 blur, and auto-zooms-out if you leave a detailed area's coverage), and a `z<NN>`
 pill flashes for 2 s on each change. See [INTERNALS.md](INTERNALS.md).
 
+**Without a fix** the map still opens, at the centre and zoom it was left at
+(no position marker until a fix arrives). On the very first open, with no view
+to return to, it frames the most detailed part of the bake: the deepest zoom at
+which everything baked at that level and deeper fits on the screen, centred on
+it. A city baked to z16 over a world base baked to z7 opens on the city. This
+lists the tile folders once ("Looking for map tiles..."), which takes a while on
+a large bake. When a fix arrives the map moves to it, unless you have panned.
+
 ## Waypoints
 
 Pan until the crosshair sits on a spot (or stay on the GPS fix), press the
@@ -106,19 +114,20 @@ ephemeral `gps.*`.
 |---|---|---|
 | `s.maps.zoom` | `15` | Slippy zoom level, clamped 1–19. Written back when the effective zoom is capped down to the tiles actually present. |
 | `s.maps.tiledir` | `/sdcard/maps` | SD path holding the `<z>/<x>/<y>.{jpg,bin}` tile tree. |
+| `s.maps.center` | unset | Where the map was left, `"lat,lon"`; it opens there before a fix. Written at most once a minute while the map is open and on close. Not in the Settings pane; unset it to get the first-open framing again. |
 
 ### Runtime state (written)
 
 | Key | Values |
 |---|---|
-| `maps.state` | `ready` / `no tiles` / `no fix` / `no sd` — ephemeral, shown read-only in the Settings pane. |
+| `maps.state` | `ready` / `no tiles` / `no fix` / `no sd` / `searching` — ephemeral, shown read-only in the Settings pane. `no fix` means no fix *and* nothing to show instead: no saved view and no tiles to frame. |
 
 ### GPS fix (read, ephemeral)
 
 | Key | Meaning |
 |---|---|
 | `gps.lat` / `gps.lon` | WGS84 degrees — the fix the map centres on. |
-| `gps.sats_view` / `gps.snr` | Satellites in view / best signal, shown on the acquisition screen before a fix. |
+| `gps.sats_view` / `gps.snr` | Satellites in view / best signal, shown on the acquisition screen (before a fix, when there is no map to show). |
 
 While the app is open it sets ephemeral `lcd.multi_touch` to `1` (and back to
 `0` on close) so the board reports both fingers for pinch.
